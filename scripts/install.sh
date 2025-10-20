@@ -19,24 +19,12 @@ log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1";}
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSIONS_FILE="$SCRIPT_DIR/../assets/versions.sh"
+VLLM_REQS_FILE="$SCRIPT_DIR/../.github/packaging/vllm_reqs.txt"
 
-if [ ! -f "$VERSIONS_FILE" ]; then
-    log_error "Versions file not found: $VERSIONS_FILE"
-    exit 1
-fi
-
-source "$VERSIONS_FILE"
-
-# Validate required variables are set
-if [ -z "${PYTORCH_VERSION:-}" ]; then
-    log_error "PYTORCH_VERSION not set in $VERSIONS_FILE"
-    exit 1
-fi
-
-WHEEL_DIR="$SCRIPT_DIR/../assets/wheels"
-RELEASE_TAG="v0.0.0-93025"
-GITHUB_REPO="meta-pytorch/forge"
+# Pinned versions from gpu_test.yaml
+PYTORCH_VERSION="2.9.0"
+VLLM_VERSION="0.10.1.dev0+g6d8d0a24c.d20251009.cu128"
+MONARCH_VERSION="0.1.0rc1"
 
 # Check conda environment
 check_conda_env() {
@@ -138,82 +126,13 @@ install_system_packages() {
     fi
 }
 
-# Check to see if gh is installed, if not, it will be installed via conda-forge channel
-check_gh_install() {
-  if ! command -v gh &> /dev/null; then
-    log_warning "GitHub CLI (gh) not found. Installing via Conda..."
-    conda install gh --channel conda-forge -y
-    log_info "GitHub CLI (gh) installed successfully."
-    log_info "Please run 'gh auth login' to authenticate with GitHub."
-  else
-    log_info "GitHub CLI (gh) already installed."
-  fi
-}
-
-# Check wheels exist
-check_wheels() {
-    if [ ! -d "$WHEEL_DIR" ]; then
-        log_error "Wheels directory not found: $WHEEL_DIR"
+# Check vLLM requirements file exists
+check_vllm_reqs() {
+    if [ ! -f "$VLLM_REQS_FILE" ]; then
+        log_error "vLLM requirements file not found: $VLLM_REQS_FILE"
         exit 1
     fi
-
-    local wheel_count=$(ls -1 "$WHEEL_DIR"/*.whl 2>/dev/null | wc -l)
-    log_info "Found $wheel_count local wheels"
-}
-
-# Download vLLM wheel from GitHub releases
-download_vllm_wheel() {
-    log_info "Downloading vLLM wheel from GitHub releases..."
-
-    # Check if gh is installed
-    if ! command -v gh &> /dev/null; then
-        log_error "GitHub CLI (gh) is required to download vLLM wheel"
-        log_info "Install it with: sudo dnf install gh"
-        log_info "Then run: gh auth login"
-        exit 1
-    fi
-
-    # Get the vLLM wheel filename from the release
-    local vllm_wheel_name
-    vllm_wheel_name=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPO" --json assets --jq '.assets[] | select(.name | contains("vllm")) | .name' | head -1)
-
-    if [ -z "$vllm_wheel_name" ]; then
-        log_error "Could not find vLLM wheel in release $RELEASE_TAG"
-        log_info "Make sure the vLLM wheel has been uploaded to the GitHub release"
-        exit 1
-    fi
-    for f in assets/wheels/vllm-*; do
-        [ -e "$f" ] || continue  # skip if glob didn't match
-        if [ "$(basename "$f")" != "$vllm_wheel_name" ]; then
-            log_info "Removing stale vLLM wheel: $(basename "$f")"
-            rm -f "$f"
-        fi
-    done
-
-    local local_path="$WHEEL_DIR/$vllm_wheel_name"
-
-    if [ -f "$local_path" ]; then
-        log_info "vLLM wheel already downloaded: $vllm_wheel_name"
-        return 0
-    fi
-
-    log_info "Downloading: $vllm_wheel_name"
-
-    # Save current directory and change to wheel directory
-    local original_dir=$(pwd)
-    cd "$WHEEL_DIR"
-    gh release download "$RELEASE_TAG" --repo "$GITHUB_REPO" --pattern "*vllm*"
-    local download_result=$?
-
-    # Always return to original directory
-    cd "$original_dir"
-
-    if [ $download_result -eq 0 ]; then
-        log_info "Successfully downloaded vLLM wheel"
-    else
-        log_error "Failed to download vLLM wheel"
-        exit 1
-    fi
+    log_info "Found vLLM requirements file"
 }
 
 
@@ -255,7 +174,6 @@ main() {
     echo "======================"
     echo ""
     echo "Note: Run this from the root of the forge repository"
-    echo "This script requires GitHub CLI (gh) to download large wheels"
     if [ "$USE_SUDO" = "true" ]; then
         echo "System packages will be installed via system package manager (requires sudo)"
         check_sudo
@@ -265,23 +183,34 @@ main() {
     echo ""
 
     check_conda_env
-    check_wheels
+    check_vllm_reqs
 
     # Install openssl as we overwrite the default version when we update LD_LIBRARY_PATH
     conda install -y openssl
 
     install_system_packages "$USE_SUDO"
-    check_gh_install
-    download_vllm_wheel
 
-    log_info "Installing PyTorch nightly..."
-    pip install torch==$PYTORCH_VERSION --index-url https://download.pytorch.org/whl/nightly/cu129
+    log_info "Updating pip..."
+    python -m pip install --upgrade pip
 
-    log_info "Installing all wheels (local + downloaded)..."
-    pip install "$WHEEL_DIR"/*.whl
+    log_info "Installing pinned PyTorch nightly..."
+    python -m pip install --pre torch==$PYTORCH_VERSION --no-cache-dir --index-url https://download.pytorch.org/whl/nightly/cu129
+
+    log_info "Installing vLLM requirements..."
+    python -m pip install -r "$VLLM_REQS_FILE"
+
+    log_info "Installing vLLM..."
+    python -m pip install vllm==$VLLM_VERSION --no-cache-dir --index-url https://download.pytorch.org/whl/preview/forge
+
+    log_info "Installing Monarch..."
+    pip install torchmonarch==$MONARCH_VERSION
+
+    log_info "Installing torchtitan and torchstore..."
+    python -m pip install git+https://github.com/pytorch/torchtitan.git
+    python -m pip install git+https://github.com/meta-pytorch/torchstore.git
 
     log_info "Installing Forge from source..."
-    pip install -e .
+    python -m pip install --no-build-isolation -e ".[dev]"
 
     # Set up environment
     log_info "Setting up environment..."
